@@ -1,0 +1,251 @@
+blueprint:
+  name: AC day/night band with hysteresis (cool or heat)
+  description: >
+    Control one or more climate entities (climate.*) using a temperature sensor.
+    - Day: turn ON/OFF within [day_low, day_high]
+    - Night (configurable hours): use [night_low, night_high] (usually wider to avoid cycling).
+    - Selectable mode: HEAT (turn on when below low_*) / COOL (turn on when above high_*).
+    - Optional toggle (input_boolean) to enable/disable easily from the UI.
+  domain: automation
+  # Replace with the RAW URL of this file in your GitHub repo:
+  source_url: https://raw.githubusercontent.com/anxolin/ha-blueprints/refs/heads/main/blueprints/automation/anxolin/ac_day_night_hysteresis.yaml
+  input:
+    temp_sensor:
+      name: Temperature sensor
+      description: Sensor used to decide when to turn AC ON/OFF (e.g., sensor.living_room_temperature)
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+
+    climates:
+      name: Climate targets
+      description: Select one or multiple climate.* entities to control
+      selector:
+        target:
+          entity:
+            domain: climate
+      default: {}
+
+    enable_switch:
+      name: Enable/disable toggle (optional)
+      description: input_boolean to quickly enable/disable control from the UI
+      default: ""
+      selector:
+        entity:
+          domain: input_boolean
+          multiple: false
+          include:
+            - input_boolean
+
+    mode:
+      name: Operating mode
+      description: In HEAT, it turns ON when temperature goes below low_*; in COOL, it turns ON when temperature goes above high_*.
+      selector:
+        select:
+          options:
+            - label: Heat
+              value: heat
+            - label: Cool
+              value: cool
+          mode: dropdown
+      default: heat
+
+    # ---- DAY thresholds
+    day_low:
+      name: Low threshold (day)
+      selector:
+        number:
+          min: -10
+          max: 50
+          step: 0.1
+          unit_of_measurement: "°C"
+      default: 20.0
+
+    day_high:
+      name: High threshold (day)
+      selector:
+        number:
+          min: -10
+          max: 50
+          step: 0.1
+          unit_of_measurement: "°C"
+      default: 22.0
+
+    # ---- NIGHT thresholds (typically wider band)
+    night_low:
+      name: Low threshold (night)
+      selector:
+        number:
+          min: -10
+          max: 50
+          step: 0.1
+          unit_of_measurement: "°C"
+      default: 19.0
+
+    night_high:
+      name: High threshold (night)
+      selector:
+        number:
+          min: -10
+          max: 50
+          step: 0.1
+          unit_of_measurement: "°C"
+      default: 23.0
+
+    # ---- Night schedule
+    night_start:
+      name: Night starts at
+      selector:
+        time: {}
+      default: "23:00:00"
+
+    night_end:
+      name: Night ends at
+      selector:
+        time: {}
+      default: "07:00:00"
+
+    min_run_minutes:
+      name: Minimum time between changes (anti-cycling, minutes)
+      description: Prevents too-frequent ON/OFF toggling.
+      selector:
+        number:
+          min: 0
+          max: 120
+          step: 1
+          unit_of_measurement: min
+      default: 5
+
+# Automation behavior:
+# - Triggers on temperature changes and every 5 minutes (to re-evaluate day/night window).
+# - Uses a wider band at night to reduce cycling.
+# - Enforces a minimum time between changes (min_run_minutes).
+# - HEAT: ON if temp < low, OFF if temp > high.
+# - COOL: ON if temp > high, OFF if temp < low.
+
+mode: restart
+max_exceeded: silent
+
+trigger:
+  # React immediately to temp changes
+  - platform: state
+    entity_id: !input temp_sensor
+  # Safety re-check so it catches the day/night window switch even if temp hasn't changed
+  - platform: time_pattern
+    minutes: "/5"
+
+variables:
+  # Bring blueprint inputs into template-safe variables
+  temp_entity: !input temp_sensor
+  enable_entity: !input enable_switch
+  night_start_v: !input night_start
+  night_end_v: !input night_end
+  day_low_v: !input day_low
+  day_high_v: !input day_high
+  night_low_v: !input night_low
+  night_high_v: !input night_high
+  selected_mode: !input mode
+  min_run_mins: !input min_run_minutes
+
+  # Current temperature (float) – 999 sentinel if sensor is unknown
+  t: "{{ states(temp_entity) | float(999) }}"
+
+  # Compute whether "now" is within the configured night window (supports crossing midnight)
+  start: "{{ strptime(night_start_v, '%H:%M:%S').time() }}"
+  end: "{{ strptime(night_end_v, '%H:%M:%S').time() }}"
+  nowt: "{{ now().time() }}"
+  is_night: >-
+    {% if start <= end %}
+      {{ nowt >= start and nowt < end }}
+    {% else %}
+      {{ nowt >= start or nowt < end }}
+    {% endif %}
+
+  # Pick thresholds depending on day/night
+  low: "{{ (is_night | bool) and (night_low_v | float)  or (day_low_v | float) }}"
+  high: "{{ (is_night | bool) and (night_high_v | float) or (day_high_v | float) }}"
+
+  # Optional enable/disable switch state
+  enabled_ok: >-
+    {% if enable_entity in [None, '', 'none'] %}
+      true
+    {% else %}
+      {{ is_state(enable_entity, 'on') }}
+    {% endif %}
+
+condition:
+  # Must have a valid temp and be enabled
+  - condition: template
+    value_template: "{{ t != 999 and enabled_ok }}"
+  # Sanity: low must be lower than high
+  - condition: template
+    value_template: "{{ (low | float) < (high | float) }}"
+
+action:
+  - choose:
+      # ---------- HEAT logic ----------
+      - conditions:
+          - condition: template
+            value_template: "{{ selected_mode == 'heat' }}"
+        sequence:
+          - choose:
+              # Turn ON if below low
+              - conditions:
+                  - condition: template
+                    value_template: "{{ t < (low | float) }}"
+                  - condition: template
+                    value_template: >
+                      {{ (now() - this.last_triggered | default(now() - timedelta(hours=1)))
+                         .total_seconds() > (min_run_mins | int(0)) * 60 }}
+                sequence:
+                  - service: climate.set_hvac_mode
+                    target: !input climates
+                    data:
+                      hvac_mode: heat
+                  - service: climate.turn_on
+                    target: !input climates
+              # Turn OFF if above high
+              - conditions:
+                  - condition: template
+                    value_template: "{{ t > (high | float) }}"
+                  - condition: template
+                    value_template: >
+                      {{ (now() - this.last_triggered | default(now() - timedelta(hours=1)))
+                         .total_seconds() > (min_run_mins | int(0)) * 60 }}
+                sequence:
+                  - service: climate.turn_off
+                    target: !input climates
+
+      # ---------- COOL logic ----------
+      - conditions:
+          - condition: template
+            value_template: "{{ selected_mode == 'cool' }}"
+        sequence:
+          - choose:
+              # Turn ON if above high
+              - conditions:
+                  - condition: template
+                    value_template: "{{ t > (high | float) }}"
+                  - condition: template
+                    value_template: >
+                      {{ (now() - this.last_triggered | default(now() - timedelta(hours=1)))
+                         .total_seconds() > (min_run_mins | int(0)) * 60 }}
+                sequence:
+                  - service: climate.set_hvac_mode
+                    target: !input climates
+                    data:
+                      hvac_mode: cool
+                  - service: climate.turn_on
+                    target: !input climates
+              # Turn OFF if below low
+              - conditions:
+                  - condition: template
+                    value_template: "{{ t < (low | float) }}"
+                  - condition: template
+                    value_template: >
+                      {{ (now() - this.last_triggered | default(now() - timedelta(hours=1)))
+                         .total_seconds() > (min_run_mins | int(0)) * 60 }}
+                sequence:
+                  - service: climate.turn_off
+                    target: !input climates
