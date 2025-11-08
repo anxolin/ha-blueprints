@@ -15,8 +15,11 @@ blueprint:
       description: Sensor used to decide when to turn AC ON/OFF (e.g., sensor.living_room_temperature)
       selector:
         entity:
-          domain: sensor
-          device_class: temperature
+          filter:
+            - domain: sensor
+              device_class:
+                - temperature
+          multiple: false
 
     climates:
       name: Climate targets
@@ -24,8 +27,7 @@ blueprint:
       selector:
         target:
           entity:
-            domain: climate
-      default: {}
+            - domain: climate
 
     enable_switch:
       name: Enable/disable toggle (optional)
@@ -33,10 +35,9 @@ blueprint:
       default: ""
       selector:
         entity:
-          domain: input_boolean
+          filter:
+            - domain: input_boolean
           multiple: false
-          include:
-            - input_boolean
 
     mode:
       name: Operating mode
@@ -48,7 +49,6 @@ blueprint:
               value: heat
             - label: Cool
               value: cool
-          mode: dropdown
       default: heat
 
     # ---- DAY thresholds
@@ -117,26 +117,20 @@ blueprint:
           unit_of_measurement: min
       default: 5
 
-# Automation behavior:
-# - Triggers on temperature changes and every 5 minutes (to re-evaluate day/night window).
-# - Uses a wider band at night to reduce cycling.
-# - Enforces a minimum time between changes (min_run_minutes).
-# - HEAT: ON if temp < low, OFF if temp > high.
-# - COOL: ON if temp > high, OFF if temp < low.
-
 mode: restart
 max_exceeded: silent
 
 trigger:
-  # React immediately to temp changes
+  # Re-evaluate when the temperature changes…
   - platform: state
     entity_id: !input temp_sensor
-  # Safety re-check so it catches the day/night window switch even if temp hasn't changed
-  - platform: time_pattern
-    minutes: "/5"
+  # …and exactly at the boundaries where day/night thresholds switch.
+  - platform: time
+    at: !input night_start
+  - platform: time
+    at: !input night_end
 
 variables:
-  # Bring blueprint inputs into template-safe variables
   temp_entity: !input temp_sensor
   enable_entity: !input enable_switch
   night_start_v: !input night_start
@@ -175,10 +169,8 @@ variables:
     {% endif %}
 
 condition:
-  # Must have a valid temp and be enabled
   - condition: template
     value_template: "{{ t != 999 and enabled_ok }}"
-  # Sanity: low must be lower than high
   - condition: template
     value_template: "{{ (low | float) < (high | float) }}"
 
